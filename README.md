@@ -1,1 +1,1 @@
-# Classification---Hotel-booking-cancellations
+# Classification for Hotel-booking-cancellations
