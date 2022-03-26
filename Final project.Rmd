@@ -1,0 +1,543 @@
+---
+title: "Prediction of hotel bookings cancellation using Machine Learning"
+author: "Xingyue Fang, Xinyi Gu, and Guillermo Trefogli"
+date: "18/03/2022"
+output: 
+  pdf_document:
+    number_sections: yes
+  html_document:
+    df_print: paged
+urlcolor: blue
+---
+```{r, warning=FALSE, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(e1071)
+library(rpart)
+library(ranger)
+library(caret)
+library(tree)
+library(xgboost)
+```
+
+```{r, warning=FALSE, echo=FALSE, message=FALSE}
+# setwd("C:/Users/guill/OneDrive/Documents/BUS_MachineLearning/Final project proposal")
+hotel <- "C:\\Users\\guill\\Box\\5. Winter 2022\\Machine Learning\\hotel_bookings.csv"
+
+df_hotel <- read.csv('hotel_bookings.csv')
+```
+# Executive Summary
+
+The main goal of this paper is to predict Hotel bookings cancellation for clients to reduce the loss caused by this problem. We apply machine learning techniques to approach this problem. We perform this analysis using a real business dataset(available at kaggle.com) containing 31 variables and almost 120,000 observations. We build several models and choose the best one to predict the probability of booking cancellations. Hotel business can choose an optimal level of threshold for themselves to maximize the profits according to its own revenues and costs using this model. By doing so, they can improve the administration of bookings and minimize loss. We provide a simulation of this exercise assuming information for revenues and costs. We believe that this analysis is relevant given that this data is common to be held by companies in this industry, which makes feasible its application to solve real world problems in the industry.
+
+# Preliminaries: data cleaning
+
+```{r}
+table(df_hotel$is_canceled)
+```
+
+The dataset can be considered as balanced.  
+
+There're only 4 na rows, we remove it. As most of the `company` column is NULL, we delete the varaible from the dataset. Also, we delete rows with NULL value as there're not many of them compared with the whole dataset. Moreover, we also delete the `reservation_status` column because it has the same meaning as our response `is_canceled`.
+
+```{r}
+df_hotel = na.omit(df_hotel)
+df_hotel = df_hotel[,-which(names(df_hotel)=='company')]
+df_hotel = df_hotel[-which(df_hotel$country=='NULL'),]
+df_hotel = df_hotel[-which(df_hotel$agent=='NULL'),]
+df_hotel = df_hotel[,-30]
+dim(df_hotel)
+```
+
+Dealing with date column:
+
+```{r}
+df_hotel <- mutate_at(df_hotel, 'reservation_status_date', function(x) as.Date(x, format = "%Y-%m-%d"))
+```
+
+Categorical variables into factor (for model building):
+
+```{r}
+df_hotel  <-  mutate_if(df_hotel, is.character, as.factor)
+df_hotel$is_canceled <- as.factor(df_hotel$is_canceled)
+str(df_hotel)
+```
+
+Less than 700 unique values into a factor:
+
+```{r}
+combinerarecategories < -function(data_frame, mincount){
+  for (i in 1:ncol(data_frame)) {
+    a<-data_frame[,i]
+    replace <- names(which(table(a) < mincount))
+    levels(a)[levels(a) %in% replace] <-
+      paste("Other", colnames(data_frame)[i], sep=".")
+    data_frame[,i]<-a
+}
+  return(data_frame)
+}
+```
+
+```{r}
+df_hotel <- combinerarecategories(df_hotel, 700)
+str(df_hotel)
+dim(df_hotel)
+```
+
+Now, all categorical variables are within 20 levels. As the hotel booking information contains booking date, we sort the dataset according to `reservation_status_date` and use first 80% as train set and the last 20% as test set:
+
+```{r}
+ntrain <- round(0.8 * nrow(df_hotel))
+tr <- sample(1 : nrow(df_hotel), ntrain)
+df.train <- df_hotel[tr,]
+df.test <- df_hotel[-tr,]
+```
+
+```{r}
+Xtrain <- df.train[,-2]
+Ytrain <- df.train[,2]
+Xtest <- df.test[,-2]
+Ytest <- df.test[,2]
+```
+
+# The Business Problem: data exploration 
+
+```{r, warning=FALSE, echo=FALSE, message=FALSE}
+# month
+month_explo <- df_hotel %>% 
+  group_by(arrival_date_month, is_canceled) %>% 
+  summarise(n = n())
+
+month_explo
+
+df_hotel %>% 
+  ggplot(aes(arrival_date_month, fill = is_canceled)) +
+  geom_bar() +
+  theme_minimal() +
+  labs(subtitle = "Month vs Booking Cancellations") +
+  theme(plot.subtitle = element_text(hjust = 0.5)) +
+  geom_text(stat = "count", aes(label = ..count..))
+
+```
+
+```{r, warning=FALSE, echo=FALSE, message=FALSE}
+#market segment
+sgmt_explo <- df_hotel %>% 
+  group_by(market_segment, is_canceled) %>% 
+  summarise(n = n()) %>% 
+  mutate(percent = n/sum(n)*100,
+         percent = paste(round(percent, 0), "%"))
+
+sgmt_explo
+
+df_hotel %>% 
+  ggplot(aes(market_segment, fill = is_canceled)) +
+  geom_bar() +
+  theme_minimal() +
+  labs(subtitle = "Market Segment vs Booking Cancellations") +
+  theme(plot.subtitle = element_text(hjust = 0.5)) +
+  geom_text(stat = "count", aes(label = ..count..))
+```
+
+# Data and Empirics
+
+In this section, we present the model and data we employ to predict the probability of booking cancellation. 
+
+The dataset contains information that comes from two datasets, each one corresponding to one different type of Hotel: city hotel and resort. The dataset has the following information: each row correspond to a booking, one variable containing the outcome (dummy indicating if the booking is canceled or not), and 31 additional variables represents the potential predictors: type of hotel, numbers of adults, etc.. In total, the dataset has 119,390 observations. The data corresponds to the bookings due to arrive between July 01, 2015 and August 31, 2017. A  The summary to explore in details the dataset can be seen in Appendix 1.
+
+To build the best model to predict the probabilty of cancellations, we will apply the following strategy, First, we will apply different techniques for classification of the outcome variable (cancellation) based on inputs (31 potential predictors). These techniques include: KNN, random forest, and boosting. Since we do not have information for cost and benefits of booking cancellations, we will employ ROC curves to choose the best model. Finally, we will offer a discussion for the models assuming information for cost and benefits of booking cancellations.
+
+# Model building 
+## Neural Network
+```{r}
+library(h2o)
+h2o.init(nthreads = -1, max_mem_size = "8G")
+```
+
+```{r}
+dftrain <- as.h2o(data.frame(x = Xtrain, y = Ytrain), destination_frame = "xor.train")
+splits <- h2o.splitFrame(dftrain, c(0.8), seed = 123)
+train <- h2o.assign(splits[[1]], "train.hex") # 80% as train set
+valid <- h2o.assign(splits[[2]], "valid.hex") # 20% as validation set
+test <- as.h2o(data.frame(x = Xtest, y = Ytest), destination_frame = "xor.train")
+
+response <- "y"
+predictors <- setdiff(names(dftrain), response)
+```
+
+First try a model:
+
+```{r,cache=TRUE}
+m1 <- h2o.deeplearning(
+  model_id = "dl_model_first", 
+  training_frame = train, 
+  validation_frame = valid, # validation data are used for scoring and early stopping
+  x = predictors,
+  y = response,
+  activation = "Tanh", # default
+  hidden = c(100,100),       
+  epochs = 100,
+  seed = 123
+)
+summary(m1)
+plot(m1)
+```
+
+Early stopping:
+
+```{r,cache=TRUE}
+m2 <- h2o.deeplearning(
+  model_id = "dl_model_faster", 
+  training_frame = train, 
+  validation_frame = valid,
+  x = predictors,
+  y = response,
+  hidden = c(16,16,16,16), # small network, runs faster
+  epochs = 1000000, # hopefully converges earlier...
+  stopping_rounds = 2,
+  stopping_metric = "logloss", # could be "MSE","logloss","r2"
+  stopping_tolerance = 0.01,
+  seed = 123
+)
+summary(m2)
+plot(m2)
+```
+
+Tuning parameters:
+
+```{r,cache=TRUE}
+m3 <- h2o.deeplearning(
+  model_id = "dl_model_tuned", 
+  training_frame = train, 
+  validation_frame = valid, 
+  x = predictors, 
+  y = response, 
+  hidden = c(32,32,32,32),      ## more hidden layers -> more complex interactions
+  epochs = 1000,                ## to keep it short enough
+  score_duty_cycle = 0.025,     ## don't score more than 2.5% of the wall time
+  l1 = 1e-5,                    ## add some L1/L2 regularization
+  l2 = 1e-5,
+  max_w2 = 10,                  ## helps stability for Rectifier
+  stopping_rounds = 2,
+  stopping_metric = "logloss",  ## could be "MSE","logloss","r2"
+  stopping_tolerance = 0.01,
+  seed = 123
+) 
+summary(m3)
+plot(m3)
+```
+
+Among m1, m2, m3We can see that m2 has the smallest logloss on validation set. 
+Let's see their performance on test set:
+
+```{r}
+h2o.performance(m1, newdata = test) 
+h2o.performance(m2, newdata = test) 
+h2o.performance(m3, newdata = test) 
+```
+
+Tuning with Grid Search:
+
+```{r, cache=TRUE}
+hyper_params <- list(
+  hidden = list(c(32,32,32),c(64,64)),
+  input_dropout_ratio = c(0,0.05),
+  l1 = c(0,1e-5,1e-3),
+  l2 = c(0,1e-5,1e-3),
+  max_w2 = c(5,10)
+)
+
+grid <- h2o.grid(
+  algorithm = "deeplearning",
+  grid_id = "dl_grid", 
+  training_frame = train,
+  validation_frame = valid, 
+  x = predictors, 
+  y = response,
+  epochs = 10,
+  stopping_metric = "logloss",
+  stopping_tolerance = 1e-2, ## stop when MSE does not improve by >=1% for 2 scoring events
+  stopping_rounds = 2,
+  score_duty_cycle = 0.025, ## don't score more than 2.5% of the wall time
+  hyper_params = hyper_params,
+  seed = 123
+)
+
+grid <- h2o.getGrid("dl_grid", sort_by = "logloss", decreasing = FALSE)
+grid
+
+grid@summary_table[1,]
+
+best_model <- h2o.getModel(grid@model_ids[[1]])
+best_model
+
+h2o.performance(best_model, newdata = test)
+```
+
+Tuning with Random Search:
+
+```{r}
+hyper_params <- list(
+  activation = c("Rectifier","Tanh","RectifierWithDropout","TanhWithDropout"),
+  hidden = list(c(20,20), c(50, 50), c(30, 30, 30), c(25, 25, 25, 25), c(64 ,64 ,64, 64)),
+  input_dropout_ratio = c(0, 0.05),
+  l1 = seq(0,1e-4, 1e-6),
+  l2 = seq(0,1e-4, 1e-6),
+  max_w2 = c(5, 10, 15)
+)
+
+## Stop once the top 5 models are within 1% of each other
+## - the windowed average varies less than 1%
+search_criteria = list(
+  strategy = "RandomDiscrete", 
+  max_runtime_secs = 360, 
+  max_models = 100, 
+  seed = 1, 
+  stopping_rounds = 5,
+  stopping_tolerance = 1e-2
+  )
+
+dl_random_grid <- h2o.grid(
+  algorithm = "deeplearning",
+  grid_id = "dl_grid_random",
+  training_frame = train,
+  validation_frame = valid, 
+  x = predictors, 
+  y = response,
+  epochs = 10,
+  stopping_metric = "logloss",
+  stopping_tolerance = 1e-2, ## stop when MSE does not improve by >=1% for 2 scoring events
+  stopping_rounds = 2,
+  score_duty_cycle = 0.025,         ## don't score more than 2.5% of the wall time
+  hyper_params = hyper_params,
+  search_criteria = search_criteria,
+  seed = 123
+)
+
+grid <- h2o.getGrid("dl_grid_random", sort_by = "logloss", decreasing = FALSE)
+grid
+grid@summary_table[1,]
+
+best_model <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest RMSE
+best_model
+
+h2o.performance(best_model, newdata = test)
+```
+
+
+\newpage
+# Three Tree models
+```{r}
+train <- cbind(Xtrain,Ytrain)
+colnames(train)[colnames(train) == 'Ytrain'] <- 'y'
+test <- cbind(Xtest,Ytest)
+colnames(test)[colnames(test) == 'Ytest'] <- 'y'
+```
+
+# Decision Tree
+```{r}
+big.tree <- rpart(y ~ ., data = train,
+                        control = rpart.control(minsplit = 5,
+                                                cp = 0.0001,
+                                                xval = 5)
+)
+
+nbig <- length(unique(big.tree$where))
+cat('size of big tree: ', nbig, '\n')
+
+cptable <-  printcp(big.tree)
+bestcp <- cptable[ which.min(cptable[,"xerror"]), "CP" ]   # this is the optimal cp parameter
+best.tree <- prune(big.tree,cp=bestcp)
+
+#check feature importance
+tvimp <- best.tree$variable.importance
+
+plot(tvimp[1:4], axes = F, pch = 16, col = 'red', ylab = "variable importance, rpart", cex = 2, cex.lab = 1.5)
+axis(1,labels = names(tvimp[1:4]), at = 1:length(tvimp[1:4]))
+axis(2)
+
+# too big to see
+temp.tree = prune(big.tree,cp=0.01)
+rpart.plot(temp.tree)
+
+# Predict on test set
+tree.pred <- predict(best.tree, newdata = Xtest, type = "class")
+xtab.tree <- table(Ytest, tree.pred)
+confusionMatrix(xtab.tree)
+```
+
+# Random Forest
+```{r}
+train$y = as.factor(train$y)
+```
+
+```{r}
+hyper_grid <- expand.grid(
+  mtry       = seq(3, 5, by = 2),
+  node_size  = c(25, 50),
+  OOB_RMSE   = 0
+)
+for(i in 1:nrow(hyper_grid)) {
+  # train model
+  model <- ranger(
+    formula         = y~.,
+    data            = train,
+    num.trees       = 500,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$node_size[i],
+    seed            = 123
+  )
+    # add OOB error to grid
+  hyper_grid$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}
+
+(oo = hyper_grid %>% 
+  dplyr::arrange(OOB_RMSE) %>%
+  head(10))
+
+#Final model for Random forest
+rf.fit.final <- ranger(
+    formula         = y~., 
+    data            = train,
+    num.trees       = 500,
+    mtry            = oo[1,]$mtry,
+    min.node.size   = oo[1,]$node_size,
+    probability = TRUE
+    )
+#Predict on test set
+rf.prob <- predict(rf.fit.final, data = Xtest)$predictions
+rf.pred <- round(rf.prob[,2])
+xtab.rf <- table(Ytest, rf.pred)
+confusionMatrix(xtab.rf)
+```
+
+\newpage
+# Boosting Model
+```{r, eval=FALSE}
+# create hyperparameter grid
+hyper_grid <- expand.grid(
+  shrinkage = c(0.1),     ## controls the learning rate
+  interaction.depth = c(5, 8), ## tree depth
+  n.minobsinnode = c(30,50), ##  minimum number of observations required in each terminal node
+  bag.fraction = c(.5),  ##  percent of training data to sample for each tree
+  optimal_trees = 0,              ## a place to dump results
+  min_RMSE = 0                    ## a place to dump results
+)
+```
+
+Then perform the grid search, also use cross-validation.
+
+```{r}
+train.xgb = Matrix::sparse.model.matrix(y ~ ., data = train)[,-1]
+test.xgb = Matrix::sparse.model.matrix(y ~ ., data = test)[,-1]
+
+for(i in 1:nrow(hyper_grid)) {
+  # create parameter list
+  params <- list(
+    eta = hyper_grid$shrinkage[i],
+    max_depth = hyper_grid$interaction.depth[i],
+    min_child_weight = hyper_grid$n.minobsinnode[i],
+    subsample = hyper_grid$bag.fraction[i]
+  )
+  
+  # reproducibility
+  set.seed(123)
+
+  # train model using Cross Validation
+  xgb.tune <- xgb.cv(
+    params = params,
+    data = train.xgb,
+    label = Ytrain,
+    nrounds = 2000,
+    nfold = 5,
+    objective = "reg:squarederror",     # for regression models
+    verbose = 0,                        # silent,
+    early_stopping_rounds = 10          # stop if no improvement for 10 consecutive trees
+  )
+  
+  # add min training error and trees to grid
+  hyper_grid$optimal_trees[i]<-which.min(xgb.tune$evaluation_log$test_rmse_mean)
+  hyper_grid$min_RMSE[i] <- min(xgb.tune$evaluation_log$test_rmse_mean)
+}
+```
+
+Arranging grid by RMSE:
+
+```{r,eval=FALSE}
+(oo = hyper_grid %>%dplyr::arrange(min_RMSE) %>%head(5))
+```
+
+Extracting best parameters:
+
+```{r,echo=FALSE}
+# parameter list
+params <- list(
+  eta = 0.1,
+  max_depth = 5,
+  min_child_weight = 30,
+  subsample = 0.5
+)
+```
+
+Training Final Model for Boosting:
+
+```{r}
+xgb.fit.final <- xgboost(
+  params = params,
+  data = train.xgb,
+  label = as.factor(train$y),
+  nrounds = 300,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+
+test.xgb = Matrix::sparse.model.matrix(y~ ., data = test)[,-1]
+
+test$y = as.factor(test$y)
+#Predict on test set
+xgb.pred = predict(xgb.fit.final, newdata = test.xgb)
+xgb.pred = as.factor(round(xgb.pred-1)) 
+
+# confusion matrix of test set
+confusionMatrix(Ytest, xgb.pred)
+```
+
+
+# ROC curves for the 3 tree models
+
+```{r}
+tree.prob <- predict(best.tree, newdata = Xtest, type = "prob")[,2]
+rf.prob <- predict(rf.fit.final, data = Xtest)$predictions[,2]
+xgb.prob <- predict(xgb.fit.final, newdata = test.xgb)
+
+yhat <- tibble("Desicion Tree" = tree.prob,"Random Forest" = rf.prob,"Boosting"= xgb.prob)
+for(i in 1:ncol(yhat)) {
+  pred = prediction(yhat[,i], Ytest)
+  perf = performance(pred, measure = "tpr", x.measure = "fpr")
+  if (i == 1) {
+  plot(perf, col = 1, lwd = 2,
+  main= 'ROC curve', xlab = 'FPR', ylab = 'TPR', cex.lab = 1) 
+    }
+    else
+    {
+  plot(perf, add = T, col = i, lwd = 2) 
+    } 
+}
+abline(0,1,lty=2)
+legend("topright", legend = colnames(yhat), col = 1:ncol(yhat), lty = rep(1, ncol(yhat)))
+```
+
+Computing AUC:
+
+```{r}
+for(i in 1:ncol(yhat)) {
+  pred = prediction(yhat[,i], Ytest)
+  perf <- performance(pred, measure = "auc")
+  print(paste0("AUC of ", colnames(yhat)[i], ": ", perf@y.values[[1]]))
+}
+```
+
+Conclusion: the best AUC is 0.98.
+
+
+
